@@ -116,7 +116,7 @@ return [
 
     'board_cleanup' => [
         'nearest_panel_distance' => 1800,
-        'delete_red_legacy_connectors' => true,
+        'delete_red_legacy_connectors' => false,
     ],
 
     'layout' => [
@@ -127,6 +127,11 @@ return [
         'panel_padding' => 56,
         'max_lines_per_panel' => 29,
         'panel_gap' => 70,
+
+        // Append-only Miro imports: each new ImportBatch is placed farther
+        // outward so older batches remain visible and are never covered/cleared.
+        'new_batch_panel_gap' => 2600,
+        'new_batch_summary_x_gap' => 2600,
 
         'group_panel_width' => 470,
         'group_panel_min_height' => 280,

@@ -18,6 +18,20 @@ class MiroLayoutService
         $regularRows = $allRows->where('is_group_project', false)->values();
         $groupRows = $allRows->where('is_group_project', true)->values();
 
+        /*
+        |--------------------------------------------------------------------------
+        | New-import batch identity
+        |--------------------------------------------------------------------------
+        |
+        | Every ImportBatch owns a fresh set of generated Miro boxes/connectors.
+        | Permanent municipality anchors intentionally remain shared. If the same
+        | batch is retried after a timeout, these stable keys stay the same so that
+        | only that partial batch is resumed instead of duplicated.
+        |
+        */
+        $batchPrefix = 'batch:'.$batch->id.':';
+        $batchSlot = $this->batchSlot($province, $batch);
+
         $mappings = MunicipalityMapping::query()
             ->where('province_id', $province->id)
             ->orderBy('sort_order')
@@ -69,8 +83,8 @@ class MiroLayoutService
             $previousPlannedY = $mapping->anchor_y;
 
             foreach ($panels as $panelIndex => $panel) {
-                $panelKey = 'panel:'.$municipalityHash.':'.$panelIndex;
-                [$x, $y] = $this->panelPosition($mapping, $panelIndex);
+                $panelKey = $batchPrefix.'panel:'.$municipalityHash.':'.$panelIndex;
+                [$x, $y] = $this->panelPosition($mapping, $panelIndex, $batchSlot);
                 $content = $this->normalPanelContent($panel['rows']);
                 $height = $this->panelHeight($panel['line_count']);
 
@@ -89,6 +103,7 @@ class MiroLayoutService
                         'municipality_key' => $municipalityKey,
                         'municipality' => $mapping->municipality,
                         'panel_index' => $panelIndex,
+                        'batch_id' => $batch->id,
                         'flow_direction' => $mapping->flow_direction,
                         'previous_key' => $previousKey,
                         'offset_x' => $x - $previousPlannedX,
@@ -98,7 +113,7 @@ class MiroLayoutService
 
                 // Arrowhead is on endItem: panel -> previous panel -> municipality pin.
                 $connectors[] = [
-                    'stable_key' => 'connector:'.$municipalityHash.':'.$panelIndex,
+                    'stable_key' => $batchPrefix.'connector:'.$municipalityHash.':'.$panelIndex,
                     'item_type' => 'connector',
                     'label' => $mapping->municipality.' connector '.($panelIndex + 1),
                     'start_key' => $panelKey,
@@ -106,6 +121,7 @@ class MiroLayoutService
                     'meta' => [
                         'municipality_key' => $municipalityKey,
                         'panel_index' => $panelIndex,
+                        'batch_id' => $batch->id,
                     ],
                 ];
 
@@ -115,8 +131,8 @@ class MiroLayoutService
             }
         }
 
-        $groupShapes = $this->groupProjectShapes($province, $groupRows, $mappings);
-        $summaryShapes = $this->summaryShapes($province, $batch, $regularRows, $groupRows, $mappings);
+        $groupShapes = $this->groupProjectShapes($province, $batch, $groupRows, $mappings, $batchSlot);
+        $summaryShapes = $this->summaryShapes($province, $batch, $regularRows, $groupRows, $mappings, $batchSlot);
 
         return [
             'shapes' => [...$shapes, ...$groupShapes, ...$summaryShapes],
@@ -126,15 +142,17 @@ class MiroLayoutService
 
     private function groupProjectShapes(
         Province $province,
+        ImportBatch $batch,
         Collection $groupRows,
         Collection $mappings,
+        int $batchSlot,
     ): array {
         if ($groupRows->isEmpty()) {
             return [];
         }
 
         $layout = config('imports.layout');
-        [$startX, $startY] = $this->groupProjectBasePosition($province, $mappings);
+        [$startX, $startY] = $this->groupProjectBasePosition($province, $mappings, $batchSlot);
         $columns = max(1, (int) ($layout['group_panel_columns'] ?? 2));
         $width = (int) ($layout['group_panel_width'] ?? 470);
         $height = (int) ($layout['group_panel_compact_height'] ?? 220);
@@ -155,7 +173,7 @@ class MiroLayoutService
             $y = $startY + ($rowIndex * ($height + $gap));
 
             $shapes[] = [
-                'stable_key' => 'group-panel:'.$groupHash.':0',
+                'stable_key' => 'batch:'.$batch->id.':group-panel:'.$groupHash.':0',
                 'item_type' => 'group_panel',
                 'label' => 'Group Project '.$projectCode,
                 'content' => $this->groupPanelContent($projectCode, $summary['beneficiary_total']),
@@ -171,6 +189,7 @@ class MiroLayoutService
                     'beneficiary_total' => $summary['beneficiary_total'],
                     'undertaking_count' => $summary['undertaking_count'],
                     'source' => 'ea9999_group_project',
+                    'batch_id' => $batch->id,
                 ],
             ];
 
@@ -186,9 +205,10 @@ class MiroLayoutService
         Collection $regularRows,
         Collection $groupRows,
         Collection $mappings,
+        int $batchSlot,
     ): array {
         $layout = config('imports.layout');
-        [$baseX, $baseY] = $this->summaryBasePosition($province, $groupRows, $mappings);
+        [$baseX, $baseY] = $this->summaryBasePosition($province, $groupRows, $mappings, $batchSlot);
 
         $leftWidth = (int) ($layout['summary_left_width'] ?? 560);
         $rightWidth = (int) ($layout['summary_right_width'] ?? 620);
@@ -217,7 +237,7 @@ class MiroLayoutService
 
         return [
             $this->summaryShape(
-                'summary:top-projects',
+                'batch:'.$batch->id.':summary:top-projects',
                 'Top 3 Projects',
                 $this->topProjectsContent($undertakingSummary['top']),
                 $leftX,
@@ -227,7 +247,7 @@ class MiroLayoutService
                 'summary_top'
             ),
             $this->summaryShape(
-                'summary:all-undertakings',
+                'batch:'.$batch->id.':summary:all-undertakings',
                 'All Undertakings',
                 $allUndertakingContent,
                 $leftX,
@@ -237,7 +257,7 @@ class MiroLayoutService
                 'summary_undertakings'
             ),
             $this->summaryShape(
-                'summary:highest-municipalities',
+                'batch:'.$batch->id.':summary:highest-municipalities',
                 'Highest Municipalities',
                 $this->highestMunicipalitiesContent($municipalitySummary['highest']),
                 $rightX,
@@ -247,7 +267,7 @@ class MiroLayoutService
                 'summary_highest'
             ),
             $this->summaryShape(
-                'summary:least-municipalities',
+                'batch:'.$batch->id.':summary:least-municipalities',
                 'Least Municipalities',
                 $this->leastMunicipalitiesContent($municipalitySummary['least']),
                 $rightX,
@@ -257,7 +277,7 @@ class MiroLayoutService
                 'summary_least'
             ),
             $this->summaryShape(
-                'summary:beneficiaries',
+                'batch:'.$batch->id.':summary:beneficiaries',
                 'Total Number of Beneficiaries',
                 '<strong>Total Number of Beneficiaries:</strong><br><br>'.
                 '<strong>Individual - '.$this->formatNumber((float) $batch->beneficiary_total).'</strong><br>'.
@@ -269,7 +289,7 @@ class MiroLayoutService
                 'summary_beneficiaries'
             ),
             $this->summaryShape(
-                'summary:group-projects-awarded',
+                'batch:'.$batch->id.':summary:group-projects-awarded',
                 'Group Projects Awarded',
                 '<strong>Group Projects Awarded:</strong><br><br><strong>'.number_format((int) $batch->group_project_count).'</strong>',
                 $rightX,
@@ -279,7 +299,7 @@ class MiroLayoutService
                 'summary_group'
             ),
             $this->summaryShape(
-                'summary:total-approved-projects',
+                'batch:'.$batch->id.':summary:total-approved-projects',
                 'Total Approved Projects',
                 '<strong>Total Approved Projects:</strong><br><br><strong>'.number_format((int) $batch->total_approved_projects).'</strong>',
                 $rightX,
@@ -594,27 +614,45 @@ class MiroLayoutService
         return max($min, min($max, $calculated));
     }
 
-    private function panelPosition(MunicipalityMapping $mapping, int $panelIndex): array
+    private function panelPosition(MunicipalityMapping $mapping, int $panelIndex, int $batchSlot): array
     {
         $layout = config('imports.layout');
         $horizontalStep = $layout['panel_width'] + $layout['panel_gap'];
         $verticalStep = $layout['panel_max_height'] + $layout['panel_gap'];
 
+        // A later import gets a new outward lane. Existing batches remain visible
+        // instead of being covered, cleared, replaced, or deleted.
+        $batchGap = max(0, (int) ($layout['new_batch_panel_gap'] ?? 2600));
+        $laneOffset = $batchSlot * $batchGap;
+
         return match ($mapping->flow_direction) {
-            'left' => [$mapping->panel_x - ($panelIndex * $horizontalStep), $mapping->panel_y],
-            'down' => [$mapping->panel_x, $mapping->panel_y + ($panelIndex * $verticalStep)],
-            'up' => [$mapping->panel_x, $mapping->panel_y - ($panelIndex * $verticalStep)],
-            default => [$mapping->panel_x + ($panelIndex * $horizontalStep), $mapping->panel_y],
+            'left' => [
+                $mapping->panel_x - $laneOffset - ($panelIndex * $horizontalStep),
+                $mapping->panel_y,
+            ],
+            'down' => [
+                $mapping->panel_x,
+                $mapping->panel_y + $laneOffset + ($panelIndex * $verticalStep),
+            ],
+            'up' => [
+                $mapping->panel_x,
+                $mapping->panel_y - $laneOffset - ($panelIndex * $verticalStep),
+            ],
+            default => [
+                $mapping->panel_x + $laneOffset + ($panelIndex * $horizontalStep),
+                $mapping->panel_y,
+            ],
         };
     }
 
-    private function groupProjectBasePosition(Province $province, Collection $mappings): array
+    private function groupProjectBasePosition(Province $province, Collection $mappings, int $batchSlot = 0): array
     {
         $layout = config('imports.layout');
         [$rightMost, $topMost] = $this->mapBounds($province, $mappings);
+        $batchX = $batchSlot * max(0, (int) ($layout['new_batch_summary_x_gap'] ?? 2600));
 
         return [
-            (int) round($rightMost + (int) ($layout['group_panel_x_gap_from_map'] ?? 900)),
+            (int) round($rightMost + (int) ($layout['group_panel_x_gap_from_map'] ?? 900) + $batchX),
             (int) round($topMost),
         ];
     }
@@ -623,19 +661,22 @@ class MiroLayoutService
         Province $province,
         Collection $groupRows,
         Collection $mappings,
+        int $batchSlot = 0,
     ): array {
         $layout = config('imports.layout');
         [$rightMost, $topMost] = $this->mapBounds($province, $mappings);
         $summaryGap = (int) ($layout['summary_x_gap'] ?? 900);
 
         if ($groupRows->isEmpty()) {
+            $batchX = $batchSlot * max(0, (int) ($layout['new_batch_summary_x_gap'] ?? 2600));
+
             return [
-                (int) round($rightMost + $summaryGap),
+                (int) round($rightMost + $summaryGap + $batchX),
                 (int) round($topMost),
             ];
         }
 
-        [$groupX] = $this->groupProjectBasePosition($province, $mappings);
+        [$groupX] = $this->groupProjectBasePosition($province, $mappings, $batchSlot);
         $columns = max(1, (int) ($layout['group_panel_columns'] ?? 2));
         $width = (int) ($layout['group_panel_width'] ?? 470);
         $gap = (int) ($layout['group_panel_gap'] ?? 90);
@@ -647,6 +688,16 @@ class MiroLayoutService
             (int) round($groupRightEdge + $summaryGap + ((int) ($layout['summary_left_width'] ?? 560) / 2)),
             (int) round($topMost),
         ];
+    }
+
+    private function batchSlot(Province $province, ImportBatch $batch): int
+    {
+        // Count earlier analyses for this province. Gaps are harmless and safer
+        // than reusing a lane that may contain a partial/failed Miro batch.
+        return ImportBatch::query()
+            ->where('province_id', $province->id)
+            ->where('id', '<', $batch->id)
+            ->count();
     }
 
     private function mapBounds(Province $province, Collection $mappings): array

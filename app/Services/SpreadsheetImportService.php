@@ -17,6 +17,217 @@ class SpreadsheetImportService
     {
         /*
         |--------------------------------------------------------------------------
+        | Source-sheet policy
+        |--------------------------------------------------------------------------
+        |
+        | Selecting Albay produces one merged import from:
+        |
+        |   Albay + Regional Office
+        |
+        | "Copy of Regional Office" is intentionally ignored.
+        | Every other province still reads only its own worksheet.
+        |
+        */
+        $analyses = [];
+
+        foreach ($this->sourceSheetsForProvince($province) as $requestedSheetName) {
+            $analyses[] = $this->analyzeSheet(
+                $absolutePath,
+                $province,
+                $requestedSheetName,
+            );
+        }
+
+        return $this->mergeSheetAnalyses($analyses);
+    }
+
+    private function sourceSheetsForProvince(Province $province): array
+    {
+        if ($this->nameKey($province->name) === $this->nameKey('Albay')) {
+            return [
+                $province->sheet_name ?: 'Albay',
+                'Regional Office',
+            ];
+        }
+
+        return [
+            $province->sheet_name ?: $province->name,
+        ];
+    }
+
+    private function mergeSheetAnalyses(array $analyses): array
+    {
+        if ($analyses === []) {
+            throw new InvalidArgumentException('No worksheet analysis results were produced.');
+        }
+
+        $regular = [];
+        $regularOrder = [];
+        $groups = [];
+        $groupOrder = [];
+        $municipalities = [];
+        $regularProjectKeys = [];
+        $groupProjectKeys = [];
+        $warnings = [];
+        $activityColumns = [];
+        $sheetNames = [];
+        $sourceRows = 0;
+
+        foreach ($analyses as $analysisIndex => $analysis) {
+            $sheetName = (string) ($analysis['sheet_name'] ?? ('Sheet '.($analysisIndex + 1)));
+            $sheetNames[] = $sheetName;
+            $sourceRows += (int) ($analysis['source_rows'] ?? 0);
+
+            foreach ($analysis['_regular_project_keys'] ?? [] as $projectKey) {
+                if ((string) $projectKey !== '') {
+                    $regularProjectKeys[(string) $projectKey] = true;
+                }
+            }
+
+            foreach ($analysis['_group_project_keys'] ?? [] as $projectKey) {
+                if ((string) $projectKey !== '') {
+                    $groupProjectKeys[(string) $projectKey] = true;
+                }
+            }
+
+            foreach ($analysis['activity_columns'] ?? [] as $label) {
+                $key = $this->nameKey((string) $label);
+
+                if ($key !== '' && !isset($activityColumns[$key])) {
+                    $activityColumns[$key] = (string) $label;
+                }
+            }
+
+            foreach ($analysis['warnings'] ?? [] as $warning) {
+                $warnings[] = '['.$sheetName.'] '.$warning;
+            }
+
+            foreach ($analysis['municipalities'] ?? [] as $municipality) {
+                $key = (string) ($municipality['key'] ?? '');
+
+                if ($key === '' || isset($municipalities[$key])) {
+                    continue;
+                }
+
+                $municipalities[$key] = [
+                    'name' => (string) ($municipality['name'] ?? $key),
+                    'key' => $key,
+                    'sort_order' => count($municipalities) + 1,
+                ];
+            }
+
+            foreach ($analysis['rows'] ?? [] as $row) {
+                $sortOrder = (($analysisIndex + 1) * 1000000) + (int) ($row['sort_order'] ?? 0);
+
+                if ((bool) ($row['is_group_project'] ?? false)) {
+                    $groupKey = (string) ($row['group_project_key'] ?? $row['barangay_key'] ?? '');
+
+                    if ($groupKey === '') {
+                        continue;
+                    }
+
+                    if (!isset($groups[$groupKey])) {
+                        $groupOrder[] = $groupKey;
+                        $groups[$groupKey] = $row;
+                        $groups[$groupKey]['sort_order'] = $sortOrder;
+                        $groups[$groupKey]['source_rows'] = array_values($row['source_rows'] ?? []);
+                        continue;
+                    }
+
+                    // Same Project Code still means one approved Group Project.
+                    $groups[$groupKey]['beneficiary_total'] = max(
+                        (float) ($groups[$groupKey]['beneficiary_total'] ?? 0),
+                        (float) ($row['beneficiary_total'] ?? 0),
+                    );
+                    $groups[$groupKey]['source_rows'] = array_values(array_unique([
+                        ...($groups[$groupKey]['source_rows'] ?? []),
+                        ...($row['source_rows'] ?? []),
+                    ]));
+
+                    continue;
+                }
+
+                $municipalityKey = (string) ($row['municipality_key'] ?? '');
+                $barangayKey = (string) ($row['barangay_key'] ?? '');
+
+                if ($municipalityKey === '' || $barangayKey === '') {
+                    continue;
+                }
+
+                $recordKey = $municipalityKey.'|'.$barangayKey;
+
+                if (!isset($regular[$recordKey])) {
+                    $regularOrder[] = $recordKey;
+                    $regular[$recordKey] = [
+                        'sort_order' => $sortOrder,
+                        'municipality' => (string) ($row['municipality'] ?? ''),
+                        'municipality_key' => $municipalityKey,
+                        'barangay' => (string) ($row['barangay'] ?? ''),
+                        'barangay_key' => $barangayKey,
+                        'undertakings' => [],
+                        'undertaking_order' => [],
+                        'source_rows' => [],
+                    ];
+                }
+
+                $regular[$recordKey]['sort_order'] = min(
+                    (int) $regular[$recordKey]['sort_order'],
+                    $sortOrder,
+                );
+                $regular[$recordKey]['source_rows'] = array_values(array_unique([
+                    ...$regular[$recordKey]['source_rows'],
+                    ...($row['source_rows'] ?? []),
+                ]));
+
+                $this->mergeUndertakings(
+                    $regular[$recordKey],
+                    $row['undertakings'] ?? [],
+                );
+            }
+        }
+
+        $regularRows = $this->finalizeAggregatedRows($regular, $regularOrder, false);
+        $groupRows = [];
+
+        foreach ($groupOrder as $groupKey) {
+            if (isset($groups[$groupKey])) {
+                $groupRows[] = $groups[$groupKey];
+            }
+        }
+
+        $rows = [...$regularRows, ...$groupRows];
+        usort(
+            $rows,
+            fn (array $a, array $b) =>
+                ((int) ($a['sort_order'] ?? 0)) <=> ((int) ($b['sort_order'] ?? 0)),
+        );
+
+        return [
+            'sheet_name' => implode(' + ', array_values(array_unique($sheetNames))),
+            'source_rows' => $sourceRows,
+            'municipality_count' => count($municipalities),
+            'barangay_count' => count($regularRows),
+            'beneficiary_total' => round(array_sum(array_column($regularRows, 'beneficiary_total')), 2),
+            'undertaking_total' => array_sum(array_column($regularRows, 'undertaking_count')),
+            'regular_project_count' => count($regularProjectKeys),
+            'group_project_count' => count($groupProjectKeys),
+            'total_approved_projects' => count($regularProjectKeys) + count($groupProjectKeys),
+            'group_beneficiary_total' => round(array_sum(array_map(
+                fn (array $row) => (float) ($row['beneficiary_total'] ?? 0),
+                $groupRows,
+            )), 2),
+            'group_undertaking_total' => 0,
+            'municipalities' => array_values($municipalities),
+            'rows' => $rows,
+            'warnings' => array_slice(array_values(array_unique($warnings)), 0, 100),
+            'activity_columns' => array_values($activityColumns),
+        ];
+    }
+
+    private function analyzeSheet(string $absolutePath, Province $province, string $requestedSheetName): array
+    {
+        /*
+        |--------------------------------------------------------------------------
         | Large workbook analysis
         |--------------------------------------------------------------------------
         |
@@ -39,7 +250,7 @@ class SpreadsheetImportService
         |--------------------------------------------------------------------------
         */
         $worksheetNames = $reader->listWorksheetNames($absolutePath);
-        $wantedSheetKey = $this->nameKey($province->sheet_name ?: $province->name);
+        $wantedSheetKey = $this->nameKey($requestedSheetName);
         $selectedSheetName = null;
 
         foreach ($worksheetNames as $worksheetName) {
@@ -52,7 +263,7 @@ class SpreadsheetImportService
         if (!$selectedSheetName) {
             throw new InvalidArgumentException(
                 'The workbook does not contain the expected worksheet "'.
-                ($province->sheet_name ?: $province->name).
+                $requestedSheetName.
                 '". Available worksheets: '.implode(', ', $worksheetNames)
             );
         }
@@ -104,38 +315,22 @@ class SpreadsheetImportService
         );
         $dataStartRow = $usesSubHeaderRow ? $subHeaderRow + 1 : $subHeaderRow;
 
-        $totalColumn = $this->findFirstTotalColumn(
-            $sheet,
-            $headerRow,
-            $barangayColumn + 1,
-            $highestColumn,
-        );
         /*
         |--------------------------------------------------------------------------
-        | Undertaking/activity range
+        | Undertaking/activity columns
         |--------------------------------------------------------------------------
         |
-        | The workbook structure is:
+        | Do NOT assume the first TOTAL column ends the undertaking section.
+        | The updated workbook places row beneficiary totals before activities on
+        | Albay, while Regional Office has a blank row-total column before its
+        | activities and additional TOTAL columns after them.
         |
-        |   CODE | No. of Beneficiaries | MUNICIPALITIES | Barangay/s
-        |        | undertaking/activity columns ...
-        |        | TOTAL (Beneficiaries)
-        |        | TOTAL (Beneficiaries PER PROJECT)
-        |
-        | Therefore every labeled column after Barangay/s and before the first
-        | beneficiary TOTAL column is a valid undertaking/activity candidate.
-        |
-        | For the current Albay sheet this resolves to E:BQ.
+        | Scan every labeled column after Barangay/s. buildActivityColumns()
+        | excludes beneficiary TOTAL/helper columns and keeps only activities.
         |
         */
         $activityStartColumn = $barangayColumn + 1;
-        $activityEndColumn = $totalColumn ? $totalColumn - 1 : $highestColumn;
-
-        if ($activityEndColumn < $activityStartColumn) {
-            throw new InvalidArgumentException(
-                'Invalid undertaking/activity column range detected in the '.$sheet->getTitle().' worksheet.'
-            );
-        }
+        $activityEndColumn = $highestColumn;
 
         $activityColumns = $this->buildActivityColumns(
             $sheet,
@@ -145,16 +340,6 @@ class SpreadsheetImportService
             $activityEndColumn,
         );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Defensive fallback
-        |--------------------------------------------------------------------------
-        |
-        | Some Excel files have a completely blank visual sub-header row. If a
-        | style/merge quirk causes the first activity pass to return nothing,
-        | rebuild directly from the main header row before failing.
-        |
-        */
         if ($activityColumns === [] && $usesSubHeaderRow) {
             $activityColumns = $this->buildActivityColumns(
                 $sheet,
@@ -169,10 +354,28 @@ class SpreadsheetImportService
             throw new InvalidArgumentException(
                 'No undertaking/activity columns were detected in the '.$sheet->getTitle().
                 ' worksheet. Detected header row: '.$headerRow.
-                ', Barangay column: '.Coordinate::stringFromColumnIndex($barangayColumn).
-                ', first TOTAL column: '.($totalColumn ? Coordinate::stringFromColumnIndex($totalColumn) : 'none').'.'
+                ', Barangay column: '.Coordinate::stringFromColumnIndex($barangayColumn).'.'
             );
         }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Optional row beneficiary total
+        |--------------------------------------------------------------------------
+        |
+        | Albay uses a labeled TOTAL immediately after Barangay/s. Regional Office
+        | uses an unlabeled numeric column E for the true row beneficiary count.
+        | The later AB total in Regional Office is deliberately ignored.
+        |
+        */
+        $totalColumn = $this->findReportedRowTotalColumn(
+            $sheet,
+            $headerRow,
+            $dataStartRow,
+            $barangayColumn,
+            $highestColumn,
+            array_column($activityColumns, 'column'),
+        );
 
         $regularAggregated = [];
         $regularOrder = [];
@@ -440,6 +643,10 @@ class SpreadsheetImportService
             'rows' => $rows,
             'warnings' => array_slice(array_values(array_unique($warnings)), 0, 100),
             'activity_columns' => array_column($activityColumns, 'label'),
+
+            // Internal merge metadata. Removed by analyze() before returning.
+            '_regular_project_keys' => array_keys($regularProjectKeys),
+            '_group_project_keys' => array_keys($groupProjectKeys),
         ];
     }
 
@@ -818,6 +1025,96 @@ class SpreadsheetImportService
         }
 
         return false;
+    }
+
+    private function findReportedRowTotalColumn(
+        Worksheet $sheet,
+        int $headerRow,
+        int $dataStartRow,
+        int $barangayColumn,
+        int $highestColumn,
+        array $activityColumnIndexes,
+    ): ?int {
+        /*
+        |--------------------------------------------------------------------------
+        | Find the REAL per-row beneficiary total without reading helper totals
+        |--------------------------------------------------------------------------
+        |
+        | Albay:
+        |   D = Barangay/s
+        |   E = TOTAL (Beneficiaries)
+        |   F = blank separator
+        |   G... = activities
+        |
+        | Regional Office:
+        |   D = Barangay/s
+        |   E = unlabeled beneficiary count
+        |   F...AA = activities
+        |   AB/AC = helper/project totals (must NOT be used here)
+        |
+        | We therefore only inspect NON-ACTIVITY columns between Barangay/s and
+        | the first undertaking column. This prevents the later AB/AC totals in
+        | Regional Office from being mistaken for the row beneficiary count.
+        |
+        */
+        $activityColumnIndexes = array_values(array_filter(array_map('intval', $activityColumnIndexes)));
+        $firstActivityColumn = $activityColumnIndexes !== []
+            ? min($activityColumnIndexes)
+            : ($highestColumn + 1);
+
+        $candidateStart = $barangayColumn + 1;
+        $candidateEnd = min($highestColumn, $firstActivityColumn - 1);
+
+        if ($candidateEnd < $candidateStart) {
+            return null;
+        }
+
+        // Prefer an explicitly labeled beneficiary TOTAL (Albay column E).
+        for ($column = $candidateStart; $column <= $candidateEnd; $column++) {
+            $header = $this->headerKey(
+                $this->cellValue($sheet->getCell([$column, $headerRow]))
+            );
+
+            if (
+                $header !== '' &&
+                str_contains($header, 'total') &&
+                str_contains($header, 'benef')
+            ) {
+                return $column;
+            }
+
+            if ($this->matchesHeaderAlias(
+                $header,
+                config('imports.header_aliases.per_barangay_total', []),
+            )) {
+                return $column;
+            }
+        }
+
+        // Regional Office column E is intentionally unlabeled. Detect the first
+        // pre-activity helper column that actually contains numeric row counts.
+        $sampleEndRow = min($sheet->getHighestDataRow(), $dataStartRow + 30);
+
+        for ($column = $candidateStart; $column <= $candidateEnd; $column++) {
+            $numericSamples = 0;
+
+            for ($row = $dataStartRow; $row <= $sampleEndRow; $row++) {
+                $value = $this->numericCount(
+                    $this->cellValue($sheet->getCell([$column, $row])),
+                    allowZero: true,
+                );
+
+                if ($value !== null) {
+                    $numericSamples++;
+
+                    if ($numericSamples >= 2) {
+                        return $column;
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
     private function findFirstTotalColumn(

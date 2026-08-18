@@ -16,12 +16,10 @@ class MiroBoardAdoptionService
     }
 
     /**
-     * Adopt permanent municipality labels and compatible legacy panels for the
-     * CURRENT province only.
+     * Discover/reuse permanent municipality labels for the CURRENT province only.
      *
-     * This service is intentionally non-destructive: importing one province must
-     * never delete, clear, re-adopt, or otherwise modify items already tracked to
-     * another province on the same Miro board.
+     * Generated green/yellow/summary boxes from older imports are never adopted,
+     * replaced, cleared, or deleted. Every new ImportBatch creates a fresh set.
      */
     public function prepare(Province $province, ImportBatch $batch): void
     {
@@ -76,45 +74,71 @@ class MiroBoardAdoptionService
             ->reject(fn (array $item) => $foreignItemIds->has((string) ($item['id'] ?? '')))
             ->values();
 
-        $legacyPanels = $availableShapeItems
-            ->filter(fn (array $item) => $this->isLegacyGreenPanel($item))
-            ->keyBy('id');
-
         $normalItems = $availableTextItems
-            ->concat(
-                $availableShapeItems->reject(
-                    fn (array $item) => $legacyPanels->has($item['id'] ?? '')
-                )
-            )
+            ->concat($availableShapeItems)
             ->values();
 
         $anchorMap = $this->discoverMunicipalityAnchors($province, $mappings, $normalItems);
+        $this->ensureDefaultPanelPositions($province, $mappings, $anchorMap);
 
-        // If generated panels already exist for this exact board, normal sync can take over.
-        $hasCurrentPanels = GeneratedMiroItem::query()
-            ->where('province_id', $province->id)
-            ->where('board_id', $province->miro_board_id)
-            ->where('item_type', 'panel')
-            ->exists();
+        /*
+        |--------------------------------------------------------------------------
+        | Append-only import policy
+        |--------------------------------------------------------------------------
+        |
+        | Stop here. Legacy/generated green panels and connectors are deliberately
+        | ignored. A new ImportBatch will receive batch-scoped stable keys and will
+        | create a fresh set of boxes without touching older batches.
+        |
+        */
+    }
 
-        if ($hasCurrentPanels) {
+    private function ensureDefaultPanelPositions(
+        Province $province,
+        Collection $mappings,
+        array $anchorMap,
+    ): void {
+        $detectedAnchors = collect($anchorMap);
+
+        if ($detectedAnchors->isEmpty()) {
             return;
         }
 
-        $connectors = collect($this->miro->getConnectors($province->miro_board_id));
-        $assignments = $this->assignLegacyPanels($mappings, $anchorMap, $legacyPanels, $connectors);
-        $this->adoptAssignedPanels($province, $mappings, $anchorMap, $assignments, $legacyPanels);
+        $centroidX = (float) $detectedAnchors->avg('x');
+        $centroidY = (float) $detectedAnchors->avg('y');
+        $panelDistance = (int) config('imports.layout.auto_panel_distance', 620);
 
-        /*
-         |--------------------------------------------------------------------------
-         | Non-destructive board policy
-         |--------------------------------------------------------------------------
-         |
-         | Do not delete old/unclaimed green panels or red connectors. They may
-         | belong to another province or may be intentionally positioned content.
-         | Normal sync will only update items tracked to the current province.
-         |
-         */
+        foreach ($mappings as $mapping) {
+            $anchor = $anchorMap[$mapping->municipality_key] ?? null;
+
+            if (!$anchor) {
+                continue;
+            }
+
+            // Preserve a Mapping Setup position the user already configured.
+            if ($mapping->panel_x !== null && $mapping->panel_y !== null) {
+                continue;
+            }
+
+            $flow = $this->flowFromVector(
+                (float) $anchor['x'] - $centroidX,
+                (float) $anchor['y'] - $centroidY,
+            );
+
+            [$panelX, $panelY] = $this->offsetPoint(
+                (float) $anchor['x'],
+                (float) $anchor['y'],
+                $flow,
+                $panelDistance,
+            );
+
+            $mapping->update([
+                'panel_x' => (int) round($panelX),
+                'panel_y' => (int) round($panelY),
+                'flow_direction' => $flow,
+                'configured' => true,
+            ]);
+        }
     }
 
     private function discoverMunicipalityAnchors(Province $province, Collection $mappings, Collection $items): array
