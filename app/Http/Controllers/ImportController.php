@@ -39,6 +39,16 @@ class ImportController extends Controller
         SpreadsheetImportService $spreadsheet,
         MunicipalityMappingService $mappingService,
     ): RedirectResponse {
+        /*
+        |--------------------------------------------------------------------------
+        | Spreadsheet analysis can exceed PHP's default 30-second web timeout.
+        |--------------------------------------------------------------------------
+        */
+        @set_time_limit(0);
+        @ini_set('max_execution_time', '0');
+        @ini_set('memory_limit', '1024M');
+        ignore_user_abort(true);
+
         $maxKb = config('imports.max_file_mb') * 1024;
 
         $validated = $request->validate([

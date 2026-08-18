@@ -15,22 +15,76 @@ class SpreadsheetImportService
 {
     public function analyze(string $absolutePath, Province $province): array
     {
+        /*
+        |--------------------------------------------------------------------------
+        | Large workbook analysis
+        |--------------------------------------------------------------------------
+        |
+        | The provincial workbook contains all six provinces plus summary sheets.
+        | Loading every worksheet with styles is unnecessary and can exceed the
+        | normal PHP web-request timeout. Group Project detection still requires
+        | styles, so we keep style-aware loading but load ONLY the selected sheet.
+        |
+        */
+        @set_time_limit(0);
+        @ini_set('max_execution_time', '0');
+        @ini_set('memory_limit', '1024M');
+        ignore_user_abort(true);
+
         $reader = IOFactory::createReaderForFile($absolutePath);
 
         /*
         |--------------------------------------------------------------------------
-        | Style-aware loading
+        | Resolve the selected province before loading workbook cells
+        |--------------------------------------------------------------------------
+        */
+        $worksheetNames = $reader->listWorksheetNames($absolutePath);
+        $wantedSheetKey = $this->nameKey($province->sheet_name ?: $province->name);
+        $selectedSheetName = null;
+
+        foreach ($worksheetNames as $worksheetName) {
+            if ($this->nameKey($worksheetName) === $wantedSheetKey) {
+                $selectedSheetName = $worksheetName;
+                break;
+            }
+        }
+
+        if (!$selectedSheetName) {
+            throw new InvalidArgumentException(
+                'The workbook does not contain the expected worksheet "'.
+                ($province->sheet_name ?: $province->name).
+                '". Available worksheets: '.implode(', ', $worksheetNames)
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Load only the selected province, WITH styles
         |--------------------------------------------------------------------------
         |
-        | #EA9999 is only used to classify an entire PROJECT block as a Group
-        | Project. We do not scan every styled cell anymore. That avoids the
-        | row-by-row style traversal that caused very long imports/timeouts.
+        | setReadDataOnly(false) is required because #EA9999 is the marker that
+        | classifies a Project Code block as a Group Project.
         |
         */
         $reader->setReadDataOnly(false);
-        $spreadsheet = $reader->load($absolutePath);
+        $reader->setLoadSheetsOnly([$selectedSheetName]);
 
-        $sheet = $this->resolveProvinceSheet($spreadsheet->getAllSheets(), $province);
+        if (method_exists($reader, 'setReadEmptyCells')) {
+            $reader->setReadEmptyCells(false);
+        }
+
+        if (method_exists($reader, 'setIncludeCharts')) {
+            $reader->setIncludeCharts(false);
+        }
+
+        $spreadsheet = $reader->load($absolutePath);
+        $sheet = $spreadsheet->getSheetByName($selectedSheetName);
+
+        if (!$sheet) {
+            throw new InvalidArgumentException(
+                'Unable to load the selected worksheet "'.$selectedSheetName.'".'
+            );
+        }
         [
             $headerRow,
             $municipalityColumn,
@@ -56,18 +110,67 @@ class SpreadsheetImportService
             $barangayColumn + 1,
             $highestColumn,
         );
+        /*
+        |--------------------------------------------------------------------------
+        | Undertaking/activity range
+        |--------------------------------------------------------------------------
+        |
+        | The workbook structure is:
+        |
+        |   CODE | No. of Beneficiaries | MUNICIPALITIES | Barangay/s
+        |        | undertaking/activity columns ...
+        |        | TOTAL (Beneficiaries)
+        |        | TOTAL (Beneficiaries PER PROJECT)
+        |
+        | Therefore every labeled column after Barangay/s and before the first
+        | beneficiary TOTAL column is a valid undertaking/activity candidate.
+        |
+        | For the current Albay sheet this resolves to E:BQ.
+        |
+        */
+        $activityStartColumn = $barangayColumn + 1;
         $activityEndColumn = $totalColumn ? $totalColumn - 1 : $highestColumn;
+
+        if ($activityEndColumn < $activityStartColumn) {
+            throw new InvalidArgumentException(
+                'Invalid undertaking/activity column range detected in the '.$sheet->getTitle().' worksheet.'
+            );
+        }
+
         $activityColumns = $this->buildActivityColumns(
             $sheet,
             $headerRow,
             $usesSubHeaderRow ? $subHeaderRow : null,
-            $barangayColumn + 1,
+            $activityStartColumn,
             $activityEndColumn,
         );
 
+        /*
+        |--------------------------------------------------------------------------
+        | Defensive fallback
+        |--------------------------------------------------------------------------
+        |
+        | Some Excel files have a completely blank visual sub-header row. If a
+        | style/merge quirk causes the first activity pass to return nothing,
+        | rebuild directly from the main header row before failing.
+        |
+        */
+        if ($activityColumns === [] && $usesSubHeaderRow) {
+            $activityColumns = $this->buildActivityColumns(
+                $sheet,
+                $headerRow,
+                null,
+                $activityStartColumn,
+                $activityEndColumn,
+            );
+        }
+
         if ($activityColumns === []) {
             throw new InvalidArgumentException(
-                'No undertaking/activity columns were detected in the '.$sheet->getTitle().' worksheet.'
+                'No undertaking/activity columns were detected in the '.$sheet->getTitle().
+                ' worksheet. Detected header row: '.$headerRow.
+                ', Barangay column: '.Coordinate::stringFromColumnIndex($barangayColumn).
+                ', first TOTAL column: '.($totalColumn ? Coordinate::stringFromColumnIndex($totalColumn) : 'none').'.'
             );
         }
 
